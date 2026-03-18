@@ -1,0 +1,225 @@
+name: Deploy YOLOv8 to OpenStack
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Validate Python App
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Test YOLO import
+        run: python -c "from ultralytics import YOLO; print('YOLO imported successfully')"
+
+      - name: Run tests if present
+        run: |
+          if [ -d tests ]; then
+            pytest tests/ -v
+          else
+            echo "No tests directory found, skipping pytest."
+          fi
+
+  deploy-to-devstack:
+    name: Deploy to DevStack
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    outputs:
+      instance_name: ${{ steps.deploy.outputs.instance_name }}
+      floating_ip: ${{ steps.deploy.outputs.floating_ip }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install OpenStack client
+        run: |
+          python -m pip install --upgrade pip
+          pip install python-openstackclient
+
+      - name: Validate required secrets
+        env:
+          OS_AUTH_URL: ${{ secrets.OS_AUTH_URL }}
+          OS_USERNAME: ${{ secrets.OS_USERNAME }}
+          OS_PASSWORD: ${{ secrets.OS_PASSWORD }}
+          OS_PROJECT_NAME: ${{ secrets.OS_PROJECT_NAME }}
+          OS_USER_DOMAIN_NAME: ${{ secrets.OS_USER_DOMAIN_NAME }}
+          OS_PROJECT_DOMAIN_NAME: ${{ secrets.OS_PROJECT_DOMAIN_NAME }}
+        run: |
+          missing=0
+          for var in OS_AUTH_URL OS_USERNAME OS_PASSWORD OS_PROJECT_NAME OS_USER_DOMAIN_NAME OS_PROJECT_DOMAIN_NAME; do
+            if [ -z "${!var}" ]; then
+              echo "Missing required secret: $var"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Configure OpenStack credentials
+        env:
+          OS_AUTH_URL: ${{ secrets.OS_AUTH_URL }}
+          OS_USERNAME: ${{ secrets.OS_USERNAME }}
+          OS_PASSWORD: ${{ secrets.OS_PASSWORD }}
+          OS_PROJECT_NAME: ${{ secrets.OS_PROJECT_NAME }}
+          OS_USER_DOMAIN_NAME: ${{ secrets.OS_USER_DOMAIN_NAME }}
+          OS_PROJECT_DOMAIN_NAME: ${{ secrets.OS_PROJECT_DOMAIN_NAME }}
+        run: |
+          mkdir -p ~/.config/openstack
+          cat > ~/.config/openstack/clouds.yaml << EOF
+          clouds:
+            devstack:
+              auth:
+                auth_url: $OS_AUTH_URL
+                username: $OS_USERNAME
+                password: $OS_PASSWORD
+                project_name: $OS_PROJECT_NAME
+                user_domain_name: $OS_USER_DOMAIN_NAME
+                project_domain_name: $OS_PROJECT_DOMAIN_NAME
+              region_name: RegionOne
+              interface: public
+              identity_api_version: 3
+          EOF
+
+      - name: Create cloud-init script
+        run: |
+          cat > cloud-init.yaml << 'EOF'
+          #cloud-config
+          package_update: true
+          packages:
+            - python3-pip
+            - python3-dev
+            - git
+            - curl
+
+          runcmd:
+            - cd /opt
+            - git clone https://github.com/${{ github.repository }}.git
+            - cd /opt/${{ github.event.repository.name }}
+            - pip3 install -r requirements.txt
+            - python3 -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+            - |
+              cat > /etc/systemd/system/yolo-fastapi.service << 'SERVICEEOF'
+              [Unit]
+              Description=YOLOv8 FastAPI Service
+              After=network.target
+
+              [Service]
+              Type=simple
+              User=root
+              WorkingDirectory=/opt/${{ github.event.repository.name }}
+              ExecStart=/usr/bin/python3 -m uvicorn app:app --host 0.0.0.0 --port 8080
+              Restart=always
+
+              [Install]
+              WantedBy=multi-user.target
+              SERVICEEOF
+            - systemctl daemon-reload
+            - systemctl enable yolo-fastapi
+            - systemctl start yolo-fastapi
+
+          final_message: "YOLO FastAPI deployment complete"
+          EOF
+
+      - name: Deploy to OpenStack
+        id: deploy
+        env:
+          OS_CLOUD: devstack
+        run: |
+          INSTANCE_NAME="yolo-fastapi-$(date +%Y%m%d-%H%M%S)"
+          echo "instance_name=$INSTANCE_NAME" >> "$GITHUB_OUTPUT"
+
+          echo "Launching instance: $INSTANCE_NAME"
+          SERVER_ID=$(openstack server create \
+            --flavor m1.small \
+            --image ubuntu-22.04-base \
+            --network yolo-private-network \
+            --security-group yolo-sg \
+            --key-name github-actions-key \
+            --user-data cloud-init.yaml \
+            --wait \
+            -f value -c id \
+            "$INSTANCE_NAME")
+
+          echo "Instance created with ID: $SERVER_ID"
+
+          FLOATING_IP=$(openstack floating ip create public -f value -c floating_ip_address)
+          openstack server add floating ip "$INSTANCE_NAME" "$FLOATING_IP"
+
+          echo "floating_ip=$FLOATING_IP" >> "$GITHUB_OUTPUT"
+          echo "FLOATING_IP=$FLOATING_IP" >> "$GITHUB_ENV"
+          echo "INSTANCE_NAME=$INSTANCE_NAME" >> "$GITHUB_ENV"
+
+          echo "Waiting for service to start (60 seconds)..."
+          sleep 60
+
+      - name: Test deployment
+        env:
+          FLOATING_IP: ${{ steps.deploy.outputs.floating_ip }}
+        run: |
+          echo "Testing API at http://$FLOATING_IP:8080"
+          curl -f "http://$FLOATING_IP:8080/" >/dev/null
+          echo "Health check passed"
+          echo "API is available at: http://$FLOATING_IP:8080"
+          echo "API docs at: http://$FLOATING_IP:8080/docs"
+
+      - name: Clean up on failure
+        if: failure()
+        env:
+          OS_CLOUD: devstack
+          INSTANCE_NAME: ${{ steps.deploy.outputs.instance_name }}
+          FLOATING_IP: ${{ steps.deploy.outputs.floating_ip }}
+        run: |
+          echo "Deployment failed, cleaning up..."
+          if [ -n "$INSTANCE_NAME" ]; then
+            openstack server delete "$INSTANCE_NAME" || true
+          fi
+          if [ -n "$FLOATING_IP" ]; then
+            openstack floating ip delete "$FLOATING_IP" || true
+          fi
+
+  performance-test:
+    name: Basic Performance Smoke Test
+    needs: deploy-to-devstack
+    if: needs.deploy-to-devstack.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run performance smoke test
+        env:
+          API_URL: http://${{ needs.deploy-to-devstack.outputs.floating_ip }}:8080
+        run: |
+          echo "Running performance checks against $API_URL"
+          for i in {1..10}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/")
+            echo "Request $i -> HTTP $code"
+            if [ "$code" -ne 200 ]; then
+              exit 1
+            fi
+          done
