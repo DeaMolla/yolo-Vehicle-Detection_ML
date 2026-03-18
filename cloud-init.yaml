@@ -1,0 +1,48 @@
+#cloud-config
+package_update: true
+packages:
+  - python3-pip
+  - python3-dev
+  - git
+  - curl
+
+write_files:
+  - path: /etc/systemd/system/yolo-fastapi.service
+    content: |
+      [Unit]
+      Description=YOLOv8 FastAPI Service
+      After=network.target
+
+      [Service]
+      Type=simple
+      User=root
+      WorkingDirectory=/opt/yolo-fastapi
+      ExecStart=/usr/local/bin/uvicorn app:app --host 0.0.0.0 --port 8080
+      Restart=always
+      RestartSec=10
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - mkdir -p /opt/yolo-fastapi
+  - cd /opt/yolo-fastapi
+  
+  # Install Python packages
+  - pip3 install fastapi uvicorn ultralytics opencv-python numpy python-multipart
+  
+  # Download your app from GitHub
+  - wget -O /opt/yolo-fastapi/app.py https://raw.githubusercontent.com/DeaMolla/yolo-Vehicle-Detection_ML/main/app.py
+  
+  # Download YOLO model
+  - python3 -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+  
+  # Create mount points for volumes
+  - mkdir -p /mnt/{logs,models,data}
+  
+  # Start service
+  - systemctl daemon-reload
+  - systemctl enable yolo-fastapi
+  - systemctl start yolo-fastapi
+
+final_message: "YOLO FastAPI deployment complete on $UPTIME"

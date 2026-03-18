@@ -60,8 +60,9 @@ jobs:
 
       - name: Install OpenStack client
         run: |
-          python -m pip install --upgrade pip
-          pip install python-openstackclient
+          # Use apt for system-wide installation on self-hosted runner
+          sudo apt update
+          sudo apt install -y python3-openstackclient
 
       - name: Validate required secrets
         env:
@@ -92,21 +93,13 @@ jobs:
           OS_USER_DOMAIN_NAME: ${{ secrets.OS_USER_DOMAIN_NAME }}
           OS_PROJECT_DOMAIN_NAME: ${{ secrets.OS_PROJECT_DOMAIN_NAME }}
         run: |
-          mkdir -p ~/.config/openstack
-          cat > ~/.config/openstack/clouds.yaml << EOF
-          clouds:
-            devstack:
-              auth:
-                auth_url: $OS_AUTH_URL
-                username: $OS_USERNAME
-                password: $OS_PASSWORD
-                project_name: $OS_PROJECT_NAME
-                user_domain_name: $OS_USER_DOMAIN_NAME
-                project_domain_name: $OS_PROJECT_DOMAIN_NAME
-              region_name: RegionOne
-              interface: public
-              identity_api_version: 3
-          EOF
+          # Source the DevStack openrc file directly (since we're on the VM)
+          source /opt/stack/devstack/openrc admin admin
+          echo "OS_AUTH_URL=$OS_AUTH_URL" >> $GITHUB_ENV
+          echo "OS_USERNAME=$OS_USERNAME" >> $GITHUB_ENV
+          echo "OS_PROJECT_NAME=$OS_PROJECT_NAME" >> $GITHUB_ENV
+          echo "OS_USER_DOMAIN_NAME=$OS_USER_DOMAIN_NAME" >> $GITHUB_ENV
+          echo "OS_PROJECT_DOMAIN_NAME=$OS_PROJECT_DOMAIN_NAME" >> $GITHUB_ENV
 
       - name: Create cloud-init script
         run: |
@@ -116,15 +109,28 @@ jobs:
           packages:
             - python3-pip
             - python3-dev
+            - python3-venv
             - git
             - curl
 
           runcmd:
-            - cd /opt
-            - git clone https://github.com/${{ github.repository }}.git
-            - cd /opt/${{ github.event.repository.name }}
-            - pip3 install -r requirements.txt
+            # Create app directory
+            - mkdir -p /opt/yolo-fastapi
+            - cd /opt/yolo-fastapi
+            
+            # Copy app from GitHub (using raw URL)
+            - curl -o /opt/yolo-fastapi/app.py https://raw.githubusercontent.com/${{ github.repository }}/main/app.py
+            - curl -o /opt/yolo-fastapi/requirements.txt https://raw.githubusercontent.com/${{ github.repository }}/main/requirements.txt
+            
+            # Install dependencies
+            - pip3 install --upgrade pip
+            - pip3 install -r /opt/yolo-fastapi/requirements.txt
+            - pip3 install ultralytics fastapi uvicorn python-multipart opencv-python numpy
+            
+            # Download YOLO model
             - python3 -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+            
+            # Create systemd service
             - |
               cat > /etc/systemd/system/yolo-fastapi.service << 'SERVICEEOF'
               [Unit]
@@ -134,13 +140,19 @@ jobs:
               [Service]
               Type=simple
               User=root
-              WorkingDirectory=/opt/${{ github.event.repository.name }}
+              WorkingDirectory=/opt/yolo-fastapi
               ExecStart=/usr/bin/python3 -m uvicorn app:app --host 0.0.0.0 --port 8080
               Restart=always
+              RestartSec=10
 
               [Install]
               WantedBy=multi-user.target
               SERVICEEOF
+            
+            # Create mount points for volumes
+            - mkdir -p /mnt/{logs,models,data}
+            
+            # Start service
             - systemctl daemon-reload
             - systemctl enable yolo-fastapi
             - systemctl start yolo-fastapi
@@ -148,11 +160,24 @@ jobs:
           final_message: "YOLO FastAPI deployment complete"
           EOF
 
+      - name: Create key pair if not exists
+        run: |
+          cd /opt/stack/devstack
+          source openrc admin admin
+          if ! openstack keypair list | grep -q "github-actions-key"; then
+            echo "Creating github-actions-key..."
+            openstack keypair create github-actions-key > /tmp/github-actions-key.pem
+            chmod 600 /tmp/github-actions-key.pem
+          else
+            echo "Key already exists"
+          fi
+
       - name: Deploy to OpenStack
         id: deploy
-        env:
-          OS_CLOUD: devstack
         run: |
+          cd /opt/stack/devstack
+          source openrc admin admin
+          
           INSTANCE_NAME="yolo-fastapi-$(date +%Y%m%d-%H%M%S)"
           echo "instance_name=$INSTANCE_NAME" >> "$GITHUB_OUTPUT"
 
@@ -163,7 +188,7 @@ jobs:
             --network yolo-private-network \
             --security-group yolo-sg \
             --key-name github-actions-key \
-            --user-data cloud-init.yaml \
+            --user-data $GITHUB_WORKSPACE/cloud-init.yaml \
             --wait \
             -f value -c id \
             "$INSTANCE_NAME")
@@ -177,32 +202,59 @@ jobs:
           echo "FLOATING_IP=$FLOATING_IP" >> "$GITHUB_ENV"
           echo "INSTANCE_NAME=$INSTANCE_NAME" >> "$GITHUB_ENV"
 
-          echo "Waiting for service to start (60 seconds)..."
-          sleep 60
+          echo "Waiting 90 seconds for service to start..."
+          sleep 90
 
       - name: Test deployment
         env:
           FLOATING_IP: ${{ steps.deploy.outputs.floating_ip }}
         run: |
           echo "Testing API at http://$FLOATING_IP:8080"
-          curl -f "http://$FLOATING_IP:8080/" >/dev/null
-          echo "Health check passed"
-          echo "API is available at: http://$FLOATING_IP:8080"
-          echo "API docs at: http://$FLOATING_IP:8080/docs"
+          
+          # Test health endpoint
+          curl -f "http://$FLOATING_IP:8080/health" || exit 1
+          echo "✅ Health check passed"
+          
+          # Test root endpoint
+          curl -f "http://$FLOATING_IP:8080/" || exit 1
+          echo "✅ Root endpoint working"
+          
+          echo ""
+          echo "✅ API is available at: http://$FLOATING_IP:8080"
+          echo "✅ API docs at: http://$FLOATING_IP:8080/docs"
+
+      - name: Run KPI measurements
+        env:
+          FLOATING_IP: ${{ steps.deploy.outputs.floating_ip }}
+        run: |
+          cd /opt/stack/devstack
+          source openrc admin admin
+          
+          # Run the KPI script if it exists
+          if [ -f "$GITHUB_WORKSPACE/measure_kpis.py" ]; then
+            pip3 install -r "$GITHUB_WORKSPACE/requirements.txt"
+            python3 "$GITHUB_WORKSPACE/measure_kpis.py" --endpoint "http://$FLOATING_IP:8080"
+          else
+            echo "No KPI script found"
+          fi
 
       - name: Clean up on failure
         if: failure()
-        env:
-          OS_CLOUD: devstack
-          INSTANCE_NAME: ${{ steps.deploy.outputs.instance_name }}
-          FLOATING_IP: ${{ steps.deploy.outputs.floating_ip }}
         run: |
+          cd /opt/stack/devstack
+          source openrc admin admin
+          
+          INSTANCE_NAME="${{ steps.deploy.outputs.instance_name }}"
+          FLOATING_IP="${{ steps.deploy.outputs.floating_ip }}"
+          
           echo "Deployment failed, cleaning up..."
-          if [ -n "$INSTANCE_NAME" ]; then
+          if [ -n "$INSTANCE_NAME" ] && openstack server show "$INSTANCE_NAME" &>/dev/null; then
             openstack server delete "$INSTANCE_NAME" || true
+            echo "✅ Instance deleted"
           fi
-          if [ -n "$FLOATING_IP" ]; then
+          if [ -n "$FLOATING_IP" ] && openstack floating ip show "$FLOATING_IP" &>/dev/null; then
             openstack floating ip delete "$FLOATING_IP" || true
+            echo "✅ Floating IP deleted"
           fi
 
   performance-test:
@@ -216,10 +268,18 @@ jobs:
           API_URL: http://${{ needs.deploy-to-devstack.outputs.floating_ip }}:8080
         run: |
           echo "Running performance checks against $API_URL"
+          
+          # Test health endpoint performance
+          echo "Testing health endpoint (10 requests)..."
           for i in {1..10}; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/")
-            echo "Request $i -> HTTP $code"
+            start=$(date +%s%N)
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/health")
+            end=$(date +%s%N)
+            duration=$(( ($end - $start) / 1000000 ))
+            echo "Request $i -> HTTP $code (${duration}ms)"
             if [ "$code" -ne 200 ]; then
               exit 1
             fi
           done
+          
+          echo "✅ All performance tests passed"
