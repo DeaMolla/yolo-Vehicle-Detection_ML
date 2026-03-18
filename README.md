@@ -24,3 +24,4 @@ python measure_kpis.py
 
 If OpenStack credentials are not configured, `measure_kpis.py` will print a clear runtime error with next steps.
 # Testing CI/CD with self-hosted runner
+# Testing CI/CD with self-hosted runner
