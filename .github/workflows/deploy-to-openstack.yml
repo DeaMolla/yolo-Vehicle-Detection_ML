@@ -43,7 +43,7 @@ jobs:
   deploy-to-devstack:
     name: Deploy to DevStack
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     outputs:
       instance_name: ${{ steps.deploy.outputs.instance_name }}
